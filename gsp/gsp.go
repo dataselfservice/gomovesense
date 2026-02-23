@@ -54,16 +54,36 @@ func (t *bleTransport) Close() error {
 	return t.client.CancelConnection()
 }
 
+// Parts how many data parts have a subs data packet. Depends on path and frequency.
+type Parts int
+
+const (
+	PartsUnknow = iota
+	PartsOne
+	PartsTwo
+)
+
 // Subscription to receive data subscribed to Path via C
 type Subscription struct {
 	// Path path subscribed
 	Path string
 	// C chan to receive data
 	C chan []byte
+
+	// buf per ref buffer, needed to autolearn DATA, DATA_PART2
+	buf []byte
+
+	// dataParts how may dataParts
+	// Autolearning based on initial packet sequences. FIXME: fragile
+	dataParts Parts
+}
+
+func NewSubscription(path string) *Subscription {
+	return &Subscription{Path: path, C: make(chan []byte, 1), dataParts: PartsUnknow, buf: make([]byte, 0)}
 }
 
 // Subscriptions map of active subscriptions
-type Subscriptions map[uint8]Subscription
+type Subscriptions map[uint8]*Subscription
 
 // GSP main GSP struct to interact with BLE client device
 type GSP struct {
@@ -186,7 +206,6 @@ func (d *GSP) Connect(ctx context.Context) (err error) {
 	// CodeCommandResponse are pushed to resp chans, while (CodeDataStream,CodeDataStream2) from subs is pushed to subs chans
 	go func() {
 
-		dBuf := []byte{}
 		for raw := range d.transport.Notify() {
 			// TODO: eventually move to clean shutdown, and turn to for { select {} }
 
@@ -220,26 +239,53 @@ func (d *GSP) Connect(ctx context.Context) (err error) {
 				d.muResp.Unlock()
 
 			case CodeDataStream:
-				// NOTE: assuming DataStream2 are send adjacent to DataStream and **NOT** interleaved on differente refs (when multiple subs are active)
-				// reseting
-				if len(dBuf) > 0 {
-					log.Panicf("subs buffer len not zero: want 0, got %d", len(dBuf))
-				}
-				dBuf = append(dBuf, p.Data...)
-				if d.sendSubDataIfComplete(dBuf, ref) {
-					dBuf = dBuf[:0]
+				// NOTE: assuming DataStream2 are sent adjacent to DataStream and **NOT** interleaved on different refs (when multiple subs are active)
+				s := d.subs[ref]
+				l := len(d.subs[ref].buf)
+
+				switch s.dataParts {
+				case PartsUnknow:
+					if l > 0 {
+						d.log.Info(fmt.Sprintf("subs ref %d learning: is PartOne", ref))
+						s.dataParts = PartsOne
+						s.C <- s.buf
+					}
+					s.buf = append([]byte{}, p.Data...)
+				case PartsOne:
+					// immediate send
+					s.C <- p.Data
+
+				case PartsTwo:
+					// save DATA
+					if l > 0 {
+						log.Panicf("buf len for subs ref %d error: want 0, got %d", ref, l)
+					}
+					s.buf = append([]byte{}, p.Data...)
 				}
 
 			case CodeDataStream2:
-				dBuf = append(dBuf, p.Data...)
-				if d.sendSubDataIfComplete(dBuf, ref) {
-					dBuf = dBuf[:0]
+				// NOTE: assuming DataStream2 are sent adjacent to DataStream and **NOT** interleaved on different refs (when multiple subs are active)
+				s := d.subs[ref]
+				l := len(d.subs[ref].buf)
+
+				switch s.dataParts {
+				case PartsUnknow:
+					if l > 0 {
+						d.log.Info(fmt.Sprintf("subs ref %d learning: is PartTwo", ref))
+						s.dataParts = PartsTwo
+						s.C <- append(s.buf, p.Data...)
+						s.buf = s.buf[:0]
+					}
+				case PartsOne:
+					log.Panicf("subs ref %d is PartOne and received DATA_PART2", ref)
+
+				case PartsTwo:
+					s.C <- append(s.buf, p.Data...)
+					s.buf = s.buf[:0]
 				}
 			}
-
 		}
 		log.Print("chan closed")
-
 	}()
 
 	return
@@ -299,7 +345,7 @@ func (d *GSP) Send(parent context.Context, cmd Command) (any, error) {
 		d.muSubs.Lock()
 		switch c := cmd.(type) {
 		case SubscribeCmd:
-			d.subs[c.GetRef()] = Subscription{Path: c.GetPath(), C: make(chan []byte, 1)}
+			d.subs[c.GetRef()] = NewSubscription(c.GetPath())
 		case UnsubscribeCmd:
 			close(d.subs[c.GetRef()].C)
 			delete(d.subs, c.GetRef())
