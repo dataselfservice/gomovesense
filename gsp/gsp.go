@@ -255,7 +255,8 @@ func (d *GSP) Send(parent context.Context, cmd Command) (any, error) {
 	var ref uint8
 	if _, ok := cmd.(UnsubscribeCmd); ok {
 		// Unsubscribe command holds ref in the command
-		ref = cmd.GetRef()
+		// **and* it does not reply with CommandReponse (#2): so just send it and return
+		return nil, d.sendRaw(ctx, cmd)
 	} else {
 		ref = d.nextRef()
 		cmd.SetRef(ref)
