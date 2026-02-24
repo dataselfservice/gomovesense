@@ -10,12 +10,13 @@ import (
 )
 
 var (
-	ms     *GSP
+	dev    *Device
 	ctx    context.Context
 	cancel context.CancelFunc
 )
 
 func TestMain(m *testing.M) {
+	var err error
 	mac := os.Getenv("MOVESENSE_MAC")
 	if mac == "" {
 		os.Exit(0) // skip all tests
@@ -25,14 +26,23 @@ func TestMain(m *testing.M) {
 	ctx, cancel = context.WithTimeout(context.Background(), 60*time.Second)
 
 	// movesense
-	ms = New(mac, slog.LevelError)
-	if err := ms.Connect(ctx); err != nil {
-		panic(err)
+	gsp := New(ctx, slog.LevelError)
+	if gsp == nil {
+		log.Panic("cannot create GSP")
+	}
+	log.Printf("Adding device %s", mac)
+	err = gsp.AddDevice(mac)
+	if err != nil {
+		log.Panic("cannot add device ", mac)
+	}
+	dev, err = gsp.GetDevice(mac)
+	if err != nil {
+		log.Panic(err)
 	}
 
 	code := m.Run()
 
-	ms.Close()
+	dev.Close()
 	cancel()
 	os.Exit(code)
 }
@@ -40,7 +50,7 @@ func TestMain(m *testing.M) {
 func TestHello(t *testing.T) {
 	cmd := NewHello()
 
-	res, err := ms.Send(ctx, cmd)
+	res, err := dev.Send(ctx, cmd)
 	if err != nil {
 		t.Fatalf("HELLO send failed: %v", err)
 	}
@@ -59,7 +69,7 @@ func TestCmd(t *testing.T) {
 		t.Run(api, func(t *testing.T) {
 			cmdGet := NewGet(api)
 
-			res, err := ms.Send(ctx, cmdGet)
+			res, err := dev.Send(ctx, cmdGet)
 			if err != nil {
 				t.Fatalf("GET %s failed: %v", api, err)
 			}
@@ -80,7 +90,7 @@ func TestSubsIMU9(t *testing.T) {
 
 	cmd := NewSubscribe(path)
 
-	res, err := ms.Send(ctx, cmd)
+	res, err := dev.Send(ctx, cmd)
 	if err != nil {
 		t.Fatalf("SUBSCRIBE failed: %v", err)
 	}
@@ -91,12 +101,12 @@ func TestSubsIMU9(t *testing.T) {
 	waitSec := 3
 	t.Logf("Capture %ds of subs data...", waitSec)
 
-	ref, err := ms.GetSubsRef(path)
+	ref, err := dev.GetSubsRef(path)
 	if err != nil {
 		log.Panic(err)
 	}
 	go func() {
-		subs := ms.GetSubs()
+		subs := dev.GetSubs()
 
 		timeout := time.NewTimer(time.Duration(waitSec) * time.Second)
 		defer timeout.Stop()
@@ -109,7 +119,7 @@ func TestSubsIMU9(t *testing.T) {
 
 			case <-timeout.C:
 				ucmd := NewUnsubscribe(ref)
-				res, err := ms.Send(ctx, ucmd)
+				res, err := dev.Send(ctx, ucmd)
 				if err != nil {
 					log.Printf("UNSUBSCRIBE failed: %v", err)
 					break For
@@ -132,7 +142,7 @@ func TestSubsAcc(t *testing.T) {
 
 	cmd := NewSubscribe(path)
 
-	res, err := ms.Send(ctx, cmd)
+	res, err := dev.Send(ctx, cmd)
 	if err != nil {
 		t.Fatalf("SUBSCRIBE failed: %v", err)
 	}
@@ -143,12 +153,12 @@ func TestSubsAcc(t *testing.T) {
 	waitSec := 3
 	t.Logf("Capture %ds of subscrubed data...", waitSec)
 
-	ref, err := ms.GetSubsRef(path)
+	ref, err := dev.GetSubsRef(path)
 	if err != nil {
 		log.Panic(err)
 	}
 	go func() {
-		subs := ms.GetSubs()
+		subs := dev.GetSubs()
 
 		timeout := time.NewTimer(time.Duration(waitSec) * time.Second)
 		defer timeout.Stop()
@@ -161,7 +171,7 @@ func TestSubsAcc(t *testing.T) {
 
 			case <-timeout.C:
 				ucmd := NewUnsubscribe(ref)
-				res, err := ms.Send(ctx, ucmd)
+				res, err := dev.Send(ctx, ucmd)
 				if err != nil {
 					log.Printf("UNSUBSCRIBE failed: %v", err)
 					break For
