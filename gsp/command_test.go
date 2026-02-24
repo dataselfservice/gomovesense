@@ -2,185 +2,158 @@ package gsp
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"log/slog"
 	"os"
+	"strings"
 	"testing"
 	"time"
 )
 
 var (
-	dev    *Device
+	macs   []string
+	gsp    *GSP
+	dev    map[string]*Device
 	ctx    context.Context
 	cancel context.CancelFunc
 )
 
 func TestMain(m *testing.M) {
-	var err error
-	mac := os.Getenv("MOVESENSE_MAC")
-	if mac == "" {
-		os.Exit(0) // skip all tests
+	macsEnv := os.Getenv("MAC")
+	if macsEnv == "" {
+		os.Exit(0)
 	}
+	macs = strings.Split(macsEnv, ",")
+	for i := range macs {
+		macs[i] = strings.TrimSpace(macs[i])
+	}
+
+	// init
+	dev = make(map[string]*Device)
 
 	// context
 	ctx, cancel = context.WithTimeout(context.Background(), 60*time.Second)
 
 	// movesense
-	gsp := New(ctx, slog.LevelError)
+	gsp = New(ctx, slog.LevelError)
 	if gsp == nil {
 		log.Panic("cannot create GSP")
 	}
-	log.Printf("Adding device %s", mac)
-	err = gsp.AddDevice(mac)
-	if err != nil {
-		log.Panic("cannot add device ", mac)
-	}
-	dev, err = gsp.GetDevice(mac)
-	if err != nil {
-		log.Panic(err)
-	}
-
 	code := m.Run()
-
-	dev.Close()
 	cancel()
+	for _, d := range dev {
+		d.Close()
+	}
 	os.Exit(code)
 }
 
-func TestHello(t *testing.T) {
-	cmd := NewHello()
-
-	res, err := dev.Send(ctx, cmd)
-	if err != nil {
-		t.Fatalf("HELLO send failed: %v", err)
+func TestDevice(t *testing.T) {
+	// add devices. No parallel execution, otherwise BLE controller fails with `can't dial: Command Disallowed`
+	for _, mac := range macs {
+		// add device
+		t.Logf("Adding device %s", mac)
+		err := gsp.AddDevice(mac)
+		if err != nil {
+			t.Fatalf("cannot add device %s: %v", mac, err)
+		}
+		dev[mac], err = gsp.GetDevice(mac)
+		if err != nil {
+			log.Panic(err)
+		}
 	}
+	// run commands in parallel for each device, after connection
+	for _, mac := range macs {
+		t.Run(mac, func(t *testing.T) {
+			t.Parallel()
 
-	t.Logf("result: %+v", res)
-}
+			dev := dev[mac]
+			// test commands
+			// HELLO
+			runHello(t, dev)
 
-func TestCmd(t *testing.T) {
-	apis := []string{
-		"/Meas/IMU/Info",
-		"/System/Energy",
-	}
-
-	for _, api := range apis {
-
-		t.Run(api, func(t *testing.T) {
-			cmdGet := NewGet(api)
-
-			res, err := dev.Send(ctx, cmdGet)
-			if err != nil {
-				t.Fatalf("GET %s failed: %v", api, err)
+			// GET
+			pathsGet := []string{
+				"/Meas/IMU/Info",
+				"/System/Energy",
+			}
+			for _, pathGet := range pathsGet {
+				runGet(t, dev, pathGet)
 			}
 
-			t.Logf("result: %+v", res)
+			// SUBSCRIBE
+			pathsSubs := []string{
+				"/Meas/IMU9/13", // only RespData
+				//path := "/Meas/IMU9/416" // RespData + RespData2
+			}
+			for _, pathSubs := range pathsSubs {
+				t.Run(pathSubs, func(t *testing.T) {
+					t.Parallel()
+					runSubs(t, dev, pathSubs, 2)
+				})
+			}
 		})
 	}
 }
 
-func TestSubsIMU9(t *testing.T) {
-	// test parallel (interleaved) subs, see TestSubscribeAcc
-	t.Parallel()
-
-	path := "/Meas/IMU9/13" // only RespData
-	//path := "/Meas/IMU9/416" // RespData + RespData2
-
-	t.Log("Subscribing to:", path)
-
-	cmd := NewSubscribe(path)
-
+func runHello(t *testing.T, dev *Device) {
+	cmd := NewHello()
 	res, err := dev.Send(ctx, cmd)
 	if err != nil {
-		t.Fatalf("SUBSCRIBE failed: %v", err)
+		t.Fatalf("%s: HELLO send failed: %v", dev.Addr(), err)
 	}
-
-	t.Logf("result: %+v", res)
-
-	// get some subscribed data
-	waitSec := 3
-	t.Logf("Capture %ds of subs data...", waitSec)
-
-	ref, err := dev.GetSubsRef(path)
-	if err != nil {
-		log.Panic(err)
-	}
-	go func() {
-		subs := dev.GetSubs()
-
-		timeout := time.NewTimer(time.Duration(waitSec) * time.Second)
-		defer timeout.Stop()
-
-	For:
-		for {
-			select {
-			case d := <-subs[ref].C:
-				t.Logf("Received subs data from ref %d, len=%d: %v", ref, len(d), d)
-
-			case <-timeout.C:
-				ucmd := NewUnsubscribe(ref)
-				res, err := dev.Send(ctx, ucmd)
-				if err != nil {
-					log.Printf("UNSUBSCRIBE failed: %v", err)
-					break For
-				}
-				t.Logf("UNSUBSCRIBE result: %+v", res)
-
-				break For
-			}
-		}
-	}()
-	time.Sleep(time.Duration(2*waitSec) * time.Second)
+	t.Logf("%s: HELLO: %+v", dev.Addr(), res)
 }
 
-func TestSubsAcc(t *testing.T) {
-	t.Parallel()
+func runGet(t *testing.T, dev *Device, path string) {
+	cmdGet := NewGet(path)
+	res, err := dev.Send(ctx, cmdGet)
+	if err != nil {
+		t.Fatalf("GET %s failed: %v", path, err)
+	}
+	t.Logf("%s: GET path %s: %+v", dev.Addr(), path, res)
+}
 
-	path := "/Meas/Acc/13"
-
-	t.Log("Subscribing to:", path)
-
+func runSubs(t *testing.T, dev *Device, path string, waitSec uint) {
 	cmd := NewSubscribe(path)
-
 	res, err := dev.Send(ctx, cmd)
 	if err != nil {
 		t.Fatalf("SUBSCRIBE failed: %v", err)
 	}
-
-	t.Logf("result: %+v", res)
+	t.Logf("%s: SUBSCRIBE path %s: %+v", dev.Addr(), path, res)
 
 	// get some subscribed data
-	waitSec := 3
-	t.Logf("Capture %ds of subscrubed data...", waitSec)
+	t.Logf("%s: Capturing %ds of subs data from path %s...", dev.Addr(), waitSec, path)
 
 	ref, err := dev.GetSubsRef(path)
 	if err != nil {
 		log.Panic(err)
 	}
+	done := make(chan error, 1)
 	go func() {
 		subs := dev.GetSubs()
 
 		timeout := time.NewTimer(time.Duration(waitSec) * time.Second)
 		defer timeout.Stop()
 
-	For:
 		for {
 			select {
 			case d := <-subs[ref].C:
-				t.Logf("Received subs data from ref %d, len=%d: %v", ref, len(d), d)
+				t.Logf("%s: Received subs data from path=%s, ref=%d, len=%d: %v", dev.Addr(), path, ref, len(d), d)
 
 			case <-timeout.C:
 				ucmd := NewUnsubscribe(ref)
 				res, err := dev.Send(ctx, ucmd)
 				if err != nil {
-					log.Printf("UNSUBSCRIBE failed: %v", err)
-					break For
+					done <- fmt.Errorf("UNSUBSCRIBE failed: %v", err)
 				}
-				t.Logf("UNSUBSCRIBE result: %+v", res)
-
-				break For
+				t.Logf("%s: UNSUBSCRIBE result: %+v", dev.Addr(), res)
+				close(done)
+				return
 			}
 		}
 	}()
-	time.Sleep(time.Duration(2*waitSec) * time.Second)
+	if err := <-done; err != nil {
+		t.Fatalf("subs faile: %v", err)
+	}
 }

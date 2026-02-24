@@ -113,6 +113,8 @@ func New(ctx context.Context, slevel slog.Level) *GSP {
 	return &g
 }
 
+// AddDevice adds and init/connect to new device
+// NOTE: you might wanna avoid running in parallel, BLE controller might complain.
 func (g *GSP) AddDevice(addr string) (err error) {
 	if _, ok := g.devices[addr]; ok {
 		return fmt.Errorf("refusing to add device with add %s: already existing", addr)
