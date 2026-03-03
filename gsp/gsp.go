@@ -93,13 +93,13 @@ type GSP struct {
 	devices map[string]*Device
 }
 
-func New(ctx context.Context, slevel slog.Level) *GSP {
+func New(ctx context.Context, slevel slog.Level, dev string) *GSP {
 	g := GSP{}
 
 	var err error
 
 	// BLE
-	g.dev, err = linux.NewDevice()
+	g.dev, err = linux.NewDeviceWithName(dev)
 	if err != nil {
 		log.Panic(err)
 	}
