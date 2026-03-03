@@ -85,8 +85,69 @@ func NewSubscription(path string) *Subscription {
 // Subscriptions map of active subscriptions
 type Subscriptions map[uint8]*Subscription
 
-// GSP main GSP struct to interact with BLE client device
 type GSP struct {
+	logLevel slog.Level
+	ctx      context.Context
+
+	dev     *linux.Device
+	devices map[string]*Device
+}
+
+func New(ctx context.Context, slevel slog.Level) *GSP {
+	g := GSP{}
+
+	var err error
+
+	// BLE
+	g.dev, err = linux.NewDevice()
+	if err != nil {
+		log.Panic(err)
+	}
+	ble.SetDefaultDevice(g.dev)
+
+	// init
+	g.ctx = ctx
+	g.logLevel = slevel
+	g.devices = make(map[string]*Device, 0)
+
+	return &g
+}
+
+// AddDevice adds and init/connect to new device
+// NOTE: you might wanna avoid running in parallel, BLE controller might complain.
+func (g *GSP) AddDevice(addr string) (err error) {
+	if _, ok := g.devices[addr]; ok {
+		return fmt.Errorf("refusing to add device with add %s: already existing", addr)
+	}
+	g.devices[addr] = NewDevice(addr, g.logLevel)
+
+	// context
+	err = g.devices[addr].Connect(g.ctx)
+	if err != nil {
+		return
+	}
+	return
+}
+func (g *GSP) Close(addr string) {
+	var err error
+	for i := range g.devices {
+		err = g.devices[i].Close()
+		if err != nil {
+			log.Print(err)
+		}
+	}
+}
+func (g *GSP) GetDevice(addr string) (dev *Device, err error) {
+	dev, ok := g.devices[addr]
+	if !ok {
+		err = fmt.Errorf("no device with addr %s", addr)
+		return
+	}
+	return
+}
+
+// Device main Device struct to interact with BLE client device
+type Device struct {
 	addr string
 
 	log *slog.Logger
@@ -101,8 +162,8 @@ type GSP struct {
 	muSubs sync.Mutex
 }
 
-func New(addr string, logLevel slog.Level) *GSP {
-	return &GSP{
+func NewDevice(addr string, logLevel slog.Level) *Device {
+	return &Device{
 		addr: addr,
 		log: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 			Level:     logLevel,
@@ -112,17 +173,10 @@ func New(addr string, logLevel slog.Level) *GSP {
 }
 
 // Connect to BLE client device having d.addr
-func (d *GSP) Connect(ctx context.Context) (err error) {
+func (d *Device) Connect(ctx context.Context) (err error) {
 	// reset
 	d.resp = make(map[uint8]chan Packet)
 	d.subs = make(Subscriptions)
-
-	// BLE
-	dev, err := linux.NewDevice()
-	if err != nil {
-		return
-	}
-	ble.SetDefaultDevice(dev)
 
 	addr := ble.NewAddr(d.addr)
 
@@ -292,7 +346,7 @@ func (d *GSP) Connect(ctx context.Context) (err error) {
 }
 
 // Send sends cmd
-func (d *GSP) Send(parent context.Context, cmd Command) (any, error) {
+func (d *Device) Send(parent context.Context, cmd Command) (any, error) {
 
 	ctx, cancel := context.WithTimeout(parent, SendCtxTimeout*time.Second)
 	defer cancel()
@@ -360,12 +414,12 @@ func (d *GSP) Send(parent context.Context, cmd Command) (any, error) {
 }
 
 // GetSubs returns active Subcriptions
-func (d *GSP) GetSubs() Subscriptions {
+func (d *Device) GetSubs() Subscriptions {
 	return d.subs
 }
 
 // GetSubsRef return Subscription to path, or error
-func (d *GSP) GetSubsRef(path string) (ref uint8, err error) {
+func (d *Device) GetSubsRef(path string) (ref uint8, err error) {
 	for k, v := range d.subs {
 		if v.Path == path {
 			return k, nil
@@ -376,17 +430,17 @@ func (d *GSP) GetSubsRef(path string) (ref uint8, err error) {
 }
 
 // Addr returns addr (BLE MAC) of client to connect to
-func (d *GSP) Addr() string {
+func (d *Device) Addr() string {
 	return d.addr
 }
 
 // Close closes
-func (d *GSP) Close() error {
+func (d *Device) Close() error {
 	return d.transport.Close()
 }
 
 // nextRef finds next free ref
-func (d *GSP) nextRef() uint8 {
+func (d *Device) nextRef() uint8 {
 	d.muResp.Lock()
 	defer d.muResp.Unlock()
 
@@ -412,7 +466,7 @@ func (d *GSP) nextRef() uint8 {
 }
 
 // sendSubDataIfComplete sends data if packet is complete
-func (d *GSP) sendSubDataIfComplete(dBuf []byte, ref uint8) (sent bool) {
+func (d *Device) sendSubDataIfComplete(dBuf []byte, ref uint8) (sent bool) {
 	// FIXME: this is specific to IMU9, which sends n=4+(4*3)*k=4+12*n, with k proportional to Hz. Packet is complete when (n-4)%12==0
 	if (len(dBuf)-4)%12 == 0 {
 		select {
@@ -427,7 +481,7 @@ func (d *GSP) sendSubDataIfComplete(dBuf []byte, ref uint8) (sent bool) {
 }
 
 // sendRaw sends command and waits response
-func (d *GSP) sendRaw(ctx context.Context, cmd Command) (err error) {
+func (d *Device) sendRaw(ctx context.Context, cmd Command) (err error) {
 
 	select {
 	case <-ctx.Done():
