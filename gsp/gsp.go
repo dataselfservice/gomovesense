@@ -159,6 +159,8 @@ type Device struct {
 
 	subs   Subscriptions
 	muSubs sync.Mutex
+
+	isConnected bool
 }
 
 func NewDevice(addr string, logLevel slog.Level) *Device {
@@ -168,7 +170,13 @@ func NewDevice(addr string, logLevel slog.Level) *Device {
 			Level:     logLevel,
 			AddSource: true,
 		})).With("MAC", addr),
+		isConnected: false,
 	}
+}
+
+// IsConnected return true when device is connected
+func (d *Device) IsConnected() bool {
+	return d.isConnected
 }
 
 // Connect to BLE client device having d.addr
@@ -272,11 +280,14 @@ func (d *Device) Connect(ctx context.Context) (err error) {
 }
 
 func (d *Device) handleConnection(client ble.Client) {
+	d.isConnected = true
+HandleLoop:
 	for {
 		select {
 		case <-client.Disconnected():
+			d.isConnected = false
 			log.Print("client with addr: ", d.addr, " disconnected. Reconnecting...")
-			break
+			break HandleLoop
 		default:
 			for raw := range d.transport.Notify() {
 				d.log.Debug(fmt.Sprintf("%+v", raw), "note", "device receive notify bytes")
@@ -362,6 +373,10 @@ func (d *Device) handleConnection(client ble.Client) {
 
 // Send sends cmd
 func (d *Device) Send(parent context.Context, cmd Command) (any, error) {
+
+	if !d.IsConnected() {
+		return nil, fmt.Errorf("device is not connected (addr: %v)", d.addr)
+	}
 
 	ctx, cancel := context.WithTimeout(parent, SendCtxTimeout*time.Second)
 	defer cancel()
