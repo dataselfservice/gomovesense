@@ -2,7 +2,6 @@ package gsp
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -180,168 +179,184 @@ func (d *Device) Connect(ctx context.Context) (err error) {
 
 	addr := ble.NewAddr(d.addr)
 
-	client, err := ble.Dial(ctx, addr)
-	if err != nil {
-		return
-	}
-
-	// tune MTU
-	_, err = client.ExchangeMTU(BleMTU)
-	if err != nil {
-		return
-	}
-
-	// discover and get desired characteristics
-	profile, err := client.DiscoverProfile(true)
-	if err != nil {
-		cerr := client.CancelConnection()
-		if cerr != nil {
-			log.Print(cerr)
-		}
-		return
-	}
-
-	svcUUID := ble.MustParse(gspServiceUUID)
-	wUUID := ble.MustParse(gspWriteUUID)
-	nUUID := ble.MustParse(gspNotifyUUID)
-
-	var writeChar *ble.Characteristic
-	var notifyChar *ble.Characteristic
-
-	for _, s := range profile.Services {
-		if !s.UUID.Equal(svcUUID) {
-			continue
-		}
-		for _, c := range s.Characteristics {
-			if c.UUID.Equal(wUUID) {
-				writeChar = c
-			}
-			if c.UUID.Equal(nUUID) {
-				notifyChar = c
-			}
-		}
-	}
-
-	if writeChar == nil || notifyChar == nil {
-		cerr := client.CancelConnection()
-		if cerr != nil {
-			log.Print(cerr)
-		}
-		return errors.New("GSP characteristics not found")
-	}
-
-	// setup notify
-	notifyC := make(chan []byte, BleMTU)
-
-	err = client.Subscribe(notifyChar, false, func(b []byte) {
-		d.log.Debug(fmt.Sprintf("%+v", b), "note", "receive bytes")
-		cp := make([]byte, len(b))
-		copy(cp, b)
-		notifyC <- cp
-	})
-	if err != nil {
-		cerr := client.CancelConnection()
-		if cerr != nil {
-			log.Print(cerr)
-		}
-		return
-	}
-
-	// setup transport
-	d.transport = &bleTransport{
-		log:     d.log,
-		client:  client,
-		write:   writeChar,
-		notify:  notifyChar,
-		notifyC: notifyC,
-	}
-
-	// receive loop: setup a go func to receive notified data, convert them to Packet.
-	// CodeCommandResponse are pushed to resp chans, while (CodeDataStream,CodeDataStream2) from subs is pushed to subs chans
 	go func() {
+		backoff := time.Second
+		for {
+			select {
+			case <-ctx.Done():
+				log.Print(ctx.Err())
+				return
+			default:
+			}
 
-		for raw := range d.transport.Notify() {
-			// TODO: eventually move to clean shutdown, and turn to for { select {} }
-
-			d.log.Debug(fmt.Sprintf("%+v", raw), "note", "device receive notify bytes")
-
-			p, err := NewPacketFromBytes(raw)
+			// dial
+			log.Print("connecting addr: ", d.addr, "...")
+			client, err := ble.Dial(ctx, addr)
 			if err != nil {
-				log.Printf("cannot decode packet from %v: %v", raw, err)
+				time.Sleep(backoff)
+				if backoff < 10*time.Second {
+					backoff *= 2
+				}
 				continue
 			}
-			d.log.Info(fmt.Sprintf("PACKET %d: %+v", len(p.Data), p))
+			backoff = time.Second
 
-			ref := p.Ref
-			// push reponses
-			switch p.Code {
-			case CodeCommandResponse:
-				// create chan if needed
-				d.muResp.Lock()
-				_, ok := d.resp[ref]
-				if !ok {
-					d.log.Debug(fmt.Sprintf("creating resp chan for ref %v", ref), "note", "device notify")
-					d.resp[ref] = make(chan Packet, 16)
+			// tune MTU
+			_, err = client.ExchangeMTU(BleMTU)
+			if err != nil {
+			}
+
+			// discover and get desired characteristics
+			profile, err := client.DiscoverProfile(true)
+			if err != nil {
+				log.Print(err)
+				continue
+			}
+
+			svcUUID := ble.MustParse(gspServiceUUID)
+			wUUID := ble.MustParse(gspWriteUUID)
+			nUUID := ble.MustParse(gspNotifyUUID)
+
+			var writeChar *ble.Characteristic
+			var notifyChar *ble.Characteristic
+
+			for _, s := range profile.Services {
+				if !s.UUID.Equal(svcUUID) {
+					continue
 				}
-				// push to chan
-				select {
-				case d.resp[ref] <- *p:
-					d.log.Debug(fmt.Sprintf("pushed Packet %v to channel resp[%v], which has size %d", *p, ref, len(d.resp)), "note", "device notify")
-				default:
-					log.Printf("cannot send. Chan resp[%d] is possibly full", ref)
-				}
-				d.muResp.Unlock()
-
-			case CodeDataStream:
-				// NOTE: assuming DataStream2 are sent adjacent to DataStream and **NOT** interleaved on different refs (when multiple subs are active)
-				s := d.subs[ref]
-				l := len(d.subs[ref].buf)
-
-				switch s.dataParts {
-				case PartsUnknow:
-					if l > 0 {
-						d.log.Info(fmt.Sprintf("subs ref %d learning: is PartOne", ref))
-						s.dataParts = PartsOne
-						s.C <- s.buf
+				for _, c := range s.Characteristics {
+					if c.UUID.Equal(wUUID) {
+						writeChar = c
 					}
-					s.buf = append([]byte{}, p.Data...)
-				case PartsOne:
-					// immediate send
-					s.C <- p.Data
-
-				case PartsTwo:
-					// save DATA
-					if l > 0 {
-						log.Panicf("buf len for subs ref %d error: want 0, got %d", ref, l)
+					if c.UUID.Equal(nUUID) {
+						notifyChar = c
 					}
-					s.buf = append([]byte{}, p.Data...)
 				}
+			}
 
-			case CodeDataStream2:
-				// NOTE: assuming DataStream2 are sent adjacent to DataStream and **NOT** interleaved on different refs (when multiple subs are active)
-				s := d.subs[ref]
-				l := len(d.subs[ref].buf)
+			if writeChar == nil || notifyChar == nil {
+				log.Print(err)
+				continue
+			}
 
-				switch s.dataParts {
-				case PartsUnknow:
-					if l > 0 {
-						d.log.Info(fmt.Sprintf("subs ref %d learning: is PartTwo", ref))
-						s.dataParts = PartsTwo
+			// setup notify
+			notifyC := make(chan []byte, BleMTU)
+
+			err = client.Subscribe(notifyChar, false, func(b []byte) {
+				d.log.Debug(fmt.Sprintf("%+v", b), "note", "receive bytes")
+				cp := make([]byte, len(b))
+				copy(cp, b)
+				notifyC <- cp
+			})
+			if err != nil {
+				log.Print(err)
+				continue
+			}
+
+			// setup transport
+			d.transport = &bleTransport{
+				log:     d.log,
+				client:  client,
+				write:   writeChar,
+				notify:  notifyChar,
+				notifyC: notifyC,
+			}
+
+			// receive loop: setup a go func to receive notified data, convert them to Packet.
+			// CodeCommandResponse are pushed to resp chans, while (CodeDataStream,CodeDataStream2) from subs is pushed to subs chans
+			d.handleConnection(client)
+		}
+	}()
+
+	return
+}
+
+func (d *Device) handleConnection(client ble.Client) {
+	for {
+		select {
+		case <-client.Disconnected():
+			log.Print("client with addr: ", d.addr, " disconnected. Reconnecting...")
+			break
+		default:
+			for raw := range d.transport.Notify() {
+				d.log.Debug(fmt.Sprintf("%+v", raw), "note", "device receive notify bytes")
+
+				p, err := NewPacketFromBytes(raw)
+				if err != nil {
+					log.Printf("cannot decode packet from %v: %v", raw, err)
+					continue
+				}
+				d.log.Info(fmt.Sprintf("PACKET %d: %+v", len(p.Data), p))
+
+				ref := p.Ref
+				// push reponses
+				switch p.Code {
+				case CodeCommandResponse:
+					// create chan if needed
+					d.muResp.Lock()
+					_, ok := d.resp[ref]
+					if !ok {
+						d.log.Debug(fmt.Sprintf("creating resp chan for ref %v", ref), "note", "device notify")
+						d.resp[ref] = make(chan Packet, 16)
+					}
+					// push to chan
+					select {
+					case d.resp[ref] <- *p:
+						d.log.Debug(fmt.Sprintf("pushed Packet %v to channel resp[%v], which has size %d", *p, ref, len(d.resp)), "note", "device notify")
+					default:
+						log.Printf("cannot send. Chan resp[%d] is possibly full", ref)
+					}
+					d.muResp.Unlock()
+
+				case CodeDataStream:
+					// NOTE: assuming DataStream2 are sent adjacent to DataStream and **NOT** interleaved on different refs (when multiple subs are active)
+					s := d.subs[ref]
+					l := len(d.subs[ref].buf)
+
+					switch s.dataParts {
+					case PartsUnknow:
+						if l > 0 {
+							d.log.Info(fmt.Sprintf("subs ref %d learning: is PartOne", ref))
+							s.dataParts = PartsOne
+							s.C <- s.buf
+						}
+						s.buf = append([]byte{}, p.Data...)
+					case PartsOne:
+						// immediate send
+						s.C <- p.Data
+
+					case PartsTwo:
+						// save DATA
+						if l > 0 {
+							log.Panicf("buf len for subs ref %d error: want 0, got %d", ref, l)
+						}
+						s.buf = append([]byte{}, p.Data...)
+					}
+
+				case CodeDataStream2:
+					// NOTE: assuming DataStream2 are sent adjacent to DataStream and **NOT** interleaved on different refs (when multiple subs are active)
+					s := d.subs[ref]
+					l := len(d.subs[ref].buf)
+
+					switch s.dataParts {
+					case PartsUnknow:
+						if l > 0 {
+							d.log.Info(fmt.Sprintf("subs ref %d learning: is PartTwo", ref))
+							s.dataParts = PartsTwo
+							s.C <- append(s.buf, p.Data...)
+							s.buf = s.buf[:0]
+						}
+					case PartsOne:
+						log.Panicf("subs ref %d is PartOne and received DATA_PART2", ref)
+
+					case PartsTwo:
 						s.C <- append(s.buf, p.Data...)
 						s.buf = s.buf[:0]
 					}
-				case PartsOne:
-					log.Panicf("subs ref %d is PartOne and received DATA_PART2", ref)
-
-				case PartsTwo:
-					s.C <- append(s.buf, p.Data...)
-					s.buf = s.buf[:0]
 				}
 			}
 		}
-		log.Print("chan closed")
-	}()
-
+	}
 	return
 }
 
