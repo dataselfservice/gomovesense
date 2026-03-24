@@ -198,9 +198,12 @@ func (d *Device) Connect(ctx context.Context) (err error) {
 			}
 
 			// dial
-			log.Print("connecting addr: ", d.addr, "...")
-			client, err := ble.Dial(ctx, addr)
+			log.Print("connecting to ", d.addr, "...")
+			ctxDial, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			client, err := ble.Dial(ctxDial, addr)
 			if err != nil {
+				log.Printf("could not connect to %v. Waiting %ds to reconnect...", d.addr, backoff)
 				time.Sleep(backoff)
 				if backoff < 10*time.Second {
 					backoff *= 2
@@ -281,13 +284,13 @@ func (d *Device) Connect(ctx context.Context) (err error) {
 
 func (d *Device) handleConnection(client ble.Client) {
 	d.isConnected = true
-HandleLoop:
+handleLoop:
 	for {
 		select {
 		case <-client.Disconnected():
 			d.isConnected = false
 			log.Print("client with addr: ", d.addr, " disconnected. Reconnecting...")
-			break HandleLoop
+			break handleLoop
 		default:
 			for raw := range d.transport.Notify() {
 				d.log.Debug(fmt.Sprintf("%+v", raw), "note", "device receive notify bytes")
@@ -374,8 +377,22 @@ HandleLoop:
 // Send sends cmd
 func (d *Device) Send(parent context.Context, cmd Command) (any, error) {
 
-	if !d.IsConnected() {
-		return nil, fmt.Errorf("device is not connected (addr: %v)", d.addr)
+	var err error
+checkConnected:
+	for {
+		select {
+
+		case <-parent.Done():
+			err = parent.Err()
+			log.Print("context done: ", err)
+			return nil, err
+		default:
+			if d.IsConnected() {
+				break checkConnected
+			}
+			log.Printf("device is not connected (addr: %v)", d.addr)
+			time.Sleep(1000 * time.Millisecond)
+		}
 	}
 
 	ctx, cancel := context.WithTimeout(parent, SendCtxTimeout*time.Second)
@@ -399,7 +416,7 @@ func (d *Device) Send(parent context.Context, cmd Command) (any, error) {
 	d.muResp.Unlock()
 
 	// send cmd
-	err := d.sendRaw(ctx, cmd)
+	err = d.sendRaw(ctx, cmd)
 	if err != nil {
 		return nil, err
 	}
