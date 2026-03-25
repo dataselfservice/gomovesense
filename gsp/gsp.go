@@ -301,82 +301,80 @@ handleLoop:
 			d.isConnected = false
 			log.Print("client with addr: ", d.addr, " disconnected. Reconnecting...")
 			break handleLoop
-		default:
-			for raw := range d.transport.Notify() {
-				d.log.Debug(fmt.Sprintf("%+v", raw), "note", "device receive notify bytes")
+		case raw := <-d.transport.Notify():
+			d.log.Debug(fmt.Sprintf("%+v", raw), "note", "device receive notify bytes")
 
-				p, err := NewPacketFromBytes(raw)
-				if err != nil {
-					log.Printf("cannot decode packet from %v: %v", raw, err)
-					continue
+			p, err := NewPacketFromBytes(raw)
+			if err != nil {
+				log.Printf("cannot decode packet from %v: %v", raw, err)
+				continue
+			}
+			d.log.Info(fmt.Sprintf("PACKET %d: %+v", len(p.Data), p))
+
+			ref := p.Ref
+			// push reponses
+			switch p.Code {
+			case CodeCommandResponse:
+				// create chan if needed
+				d.muResp.Lock()
+				_, ok := d.resp[ref]
+				if !ok {
+					d.log.Debug(fmt.Sprintf("creating resp chan for ref %v", ref), "note", "device notify")
+					d.resp[ref] = make(chan Packet, 16)
 				}
-				d.log.Info(fmt.Sprintf("PACKET %d: %+v", len(p.Data), p))
+				// push to chan
+				select {
+				case d.resp[ref] <- *p:
+					d.log.Debug(fmt.Sprintf("pushed Packet %v to channel resp[%v], which has size %d", *p, ref, len(d.resp)), "note", "device notify")
+				default:
+					log.Printf("cannot send. Chan resp[%d] is possibly full", ref)
+				}
+				d.muResp.Unlock()
 
-				ref := p.Ref
-				// push reponses
-				switch p.Code {
-				case CodeCommandResponse:
-					// create chan if needed
-					d.muResp.Lock()
-					_, ok := d.resp[ref]
-					if !ok {
-						d.log.Debug(fmt.Sprintf("creating resp chan for ref %v", ref), "note", "device notify")
-						d.resp[ref] = make(chan Packet, 16)
+			case CodeDataStream:
+				// NOTE: assuming DataStream2 are sent adjacent to DataStream and **NOT** interleaved on different refs (when multiple subs are active)
+				s := d.subs[ref]
+				l := len(d.subs[ref].buf)
+
+				switch s.dataParts {
+				case PartsUnknow:
+					if l > 0 {
+						d.log.Info(fmt.Sprintf("subs ref %d learning: is PartOne", ref))
+						s.dataParts = PartsOne
+						s.C <- s.buf
 					}
-					// push to chan
-					select {
-					case d.resp[ref] <- *p:
-						d.log.Debug(fmt.Sprintf("pushed Packet %v to channel resp[%v], which has size %d", *p, ref, len(d.resp)), "note", "device notify")
-					default:
-						log.Printf("cannot send. Chan resp[%d] is possibly full", ref)
+					s.buf = append([]byte{}, p.Data...)
+				case PartsOne:
+					// immediate send
+					s.C <- p.Data
+
+				case PartsTwo:
+					// save DATA
+					if l > 0 {
+						log.Panicf("buf len for subs ref %d error: want 0, got %d", ref, l)
 					}
-					d.muResp.Unlock()
+					s.buf = append([]byte{}, p.Data...)
+				}
 
-				case CodeDataStream:
-					// NOTE: assuming DataStream2 are sent adjacent to DataStream and **NOT** interleaved on different refs (when multiple subs are active)
-					s := d.subs[ref]
-					l := len(d.subs[ref].buf)
+			case CodeDataStream2:
+				// NOTE: assuming DataStream2 are sent adjacent to DataStream and **NOT** interleaved on different refs (when multiple subs are active)
+				s := d.subs[ref]
+				l := len(d.subs[ref].buf)
 
-					switch s.dataParts {
-					case PartsUnknow:
-						if l > 0 {
-							d.log.Info(fmt.Sprintf("subs ref %d learning: is PartOne", ref))
-							s.dataParts = PartsOne
-							s.C <- s.buf
-						}
-						s.buf = append([]byte{}, p.Data...)
-					case PartsOne:
-						// immediate send
-						s.C <- p.Data
-
-					case PartsTwo:
-						// save DATA
-						if l > 0 {
-							log.Panicf("buf len for subs ref %d error: want 0, got %d", ref, l)
-						}
-						s.buf = append([]byte{}, p.Data...)
-					}
-
-				case CodeDataStream2:
-					// NOTE: assuming DataStream2 are sent adjacent to DataStream and **NOT** interleaved on different refs (when multiple subs are active)
-					s := d.subs[ref]
-					l := len(d.subs[ref].buf)
-
-					switch s.dataParts {
-					case PartsUnknow:
-						if l > 0 {
-							d.log.Info(fmt.Sprintf("subs ref %d learning: is PartTwo", ref))
-							s.dataParts = PartsTwo
-							s.C <- append(s.buf, p.Data...)
-							s.buf = s.buf[:0]
-						}
-					case PartsOne:
-						log.Panicf("subs ref %d is PartOne and received DATA_PART2", ref)
-
-					case PartsTwo:
+				switch s.dataParts {
+				case PartsUnknow:
+					if l > 0 {
+						d.log.Info(fmt.Sprintf("subs ref %d learning: is PartTwo", ref))
+						s.dataParts = PartsTwo
 						s.C <- append(s.buf, p.Data...)
 						s.buf = s.buf[:0]
 					}
+				case PartsOne:
+					log.Panicf("subs ref %d is PartOne and received DATA_PART2", ref)
+
+				case PartsTwo:
+					s.C <- append(s.buf, p.Data...)
+					s.buf = s.buf[:0]
 				}
 			}
 		}
