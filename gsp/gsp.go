@@ -281,6 +281,15 @@ func (d *Device) Connect(ctx context.Context) (err error) {
 				notifyC: notifyC,
 			}
 
+			d.muSubs.Lock()
+			for ref, s := range d.subs {
+				// send subscribe (again in case of reconnect)
+				cmd := NewSubscribe(s.Path)
+				cmd.SetRef(ref)
+				_ = d.sendRaw(context.Background(), cmd)
+			}
+			d.muSubs.Unlock()
+
 			// receive loop: setup a go func to receive notified data, convert them to Packet.
 			// CodeCommandResponse are pushed to resp chans, while (CodeDataStream,CodeDataStream2) from subs is pushed to subs chans
 			d.handleConnection(client)
