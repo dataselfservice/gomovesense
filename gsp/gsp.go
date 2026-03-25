@@ -23,6 +23,11 @@ const (
 	StatusOK = 200
 
 	SendCtxTimeout = 1
+
+	BackoffMaxSecond     = 10
+	BleDialTimeoutSecond = 5
+
+	RecheckConnectedMillisecond = 1000
 )
 
 // BLETransport BLE transport
@@ -198,15 +203,18 @@ func (d *Device) Connect(ctx context.Context) (err error) {
 			}
 
 			// dial
-			log.Print("connecting to ", d.addr, "...")
-			ctxDial, cancel := context.WithTimeout(ctx, 5*time.Second)
+			dialTimeout := BleDialTimeoutSecond * time.Second
+			ctxDial, cancel := context.WithTimeout(ctx, dialTimeout)
 			defer cancel()
 			client, err := ble.Dial(ctxDial, addr)
 			if err != nil {
-				log.Printf("could not connect to %v. Waiting %ds to reconnect...", d.addr, backoff)
+				log.Printf("could not connect to %v in %v. Waiting %v to reconnect...", d.addr, dialTimeout, backoff)
 				time.Sleep(backoff)
-				if backoff < 10*time.Second {
+				if backoff < BackoffMaxSecond*time.Second {
 					backoff *= 2
+					if backoff > BackoffMaxSecond*time.Second {
+						backoff = BackoffMaxSecond * time.Second
+					}
 				}
 				continue
 			}
@@ -284,6 +292,8 @@ func (d *Device) Connect(ctx context.Context) (err error) {
 
 func (d *Device) handleConnection(client ble.Client) {
 	d.isConnected = true
+	log.Print("Connected to ", d.addr)
+
 handleLoop:
 	for {
 		select {
@@ -374,25 +384,31 @@ handleLoop:
 	return
 }
 
-// Send sends cmd
-func (d *Device) Send(parent context.Context, cmd Command) (any, error) {
-
-	var err error
-checkConnected:
+// waitConencted recheck IsConnected, timeouts based on context and return nil if connected
+func (d *Device) waitConnected(parent context.Context) (err error) {
 	for {
 		select {
 
 		case <-parent.Done():
 			err = parent.Err()
 			log.Print("context done: ", err)
-			return nil, err
+			return
 		default:
 			if d.IsConnected() {
-				break checkConnected
+				return
 			}
-			log.Printf("device is not connected (addr: %v)", d.addr)
-			time.Sleep(1000 * time.Millisecond)
+			time.Sleep(RecheckConnectedMillisecond * time.Millisecond)
 		}
+	}
+}
+
+// Send sends cmd
+func (d *Device) Send(parent context.Context, cmd Command) (any, error) {
+
+	var err error
+
+	if err = d.waitConnected(parent); err != nil {
+		return nil, err
 	}
 
 	ctx, cancel := context.WithTimeout(parent, SendCtxTimeout*time.Second)
