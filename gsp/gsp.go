@@ -2,7 +2,6 @@ package gsp
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -24,6 +23,11 @@ const (
 	StatusOK = 200
 
 	SendCtxTimeout = 1
+
+	BackoffMaxSecond     = 10
+	BleDialTimeoutSecond = 5
+
+	RecheckConnectedMillisecond = 1000
 )
 
 // BLETransport BLE transport
@@ -54,19 +58,100 @@ func (t *bleTransport) Close() error {
 	return t.client.CancelConnection()
 }
 
+// Parts how many data parts have a subs data packet. Depends on path and frequency.
+type Parts int
+
+const (
+	PartsUnknow = iota
+	PartsOne
+	PartsTwo
+)
+
 // Subscription to receive data subscribed to Path via C
 type Subscription struct {
 	// Path path subscribed
 	Path string
 	// C chan to receive data
 	C chan []byte
+
+	// buf per ref buffer, needed to autolearn DATA, DATA_PART2
+	buf []byte
+
+	// dataParts how may dataParts
+	// Autolearning based on initial packet sequences. FIXME: fragile
+	dataParts Parts
+}
+
+func NewSubscription(path string) *Subscription {
+	return &Subscription{Path: path, C: make(chan []byte, 1), dataParts: PartsUnknow, buf: make([]byte, 0)}
 }
 
 // Subscriptions map of active subscriptions
-type Subscriptions map[uint8]Subscription
+type Subscriptions map[uint8]*Subscription
 
-// GSP main GSP struct to interact with BLE client device
 type GSP struct {
+	logLevel slog.Level
+	ctx      context.Context
+
+	dev     *linux.Device
+	devices map[string]*Device
+}
+
+func New(ctx context.Context, slevel slog.Level, dev string) *GSP {
+	g := GSP{}
+
+	var err error
+
+	// BLE
+	g.dev, err = linux.NewDeviceWithName(dev)
+	if err != nil {
+		log.Panic(err)
+	}
+	ble.SetDefaultDevice(g.dev)
+
+	// init
+	g.ctx = ctx
+	g.logLevel = slevel
+	g.devices = make(map[string]*Device, 0)
+
+	return &g
+}
+
+// AddDevice adds and init/connect to new device
+// NOTE: you might wanna avoid running in parallel, BLE controller might complain.
+func (g *GSP) AddDevice(addr string) (err error) {
+	if _, ok := g.devices[addr]; ok {
+		return fmt.Errorf("refusing to add device with add %s: already existing", addr)
+	}
+	g.devices[addr] = NewDevice(addr, g.logLevel)
+
+	// context
+	err = g.devices[addr].Connect(g.ctx)
+	if err != nil {
+		return
+	}
+	return
+}
+func (g *GSP) Close(addr string) {
+	var err error
+	for i := range g.devices {
+		err = g.devices[i].Close()
+		if err != nil {
+			log.Print(err)
+		}
+	}
+}
+func (g *GSP) GetDevice(addr string) (dev *Device, err error) {
+	dev, ok := g.devices[addr]
+	if !ok {
+		err = fmt.Errorf("no device with addr %s", addr)
+		return
+	}
+	return
+}
+
+// Device main Device struct to interact with BLE client device
+type Device struct {
 	addr string
 
 	log *slog.Logger
@@ -79,117 +164,153 @@ type GSP struct {
 
 	subs   Subscriptions
 	muSubs sync.Mutex
+
+	isConnected bool
 }
 
-func New(addr string, logLevel slog.Level) *GSP {
-	return &GSP{
+func NewDevice(addr string, logLevel slog.Level) *Device {
+	return &Device{
 		addr: addr,
 		log: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
 			Level:     logLevel,
 			AddSource: true,
 		})).With("MAC", addr),
+		isConnected: false,
 	}
 }
 
+// IsConnected return true when device is connected
+func (d *Device) IsConnected() bool {
+	return d.isConnected
+}
+
 // Connect to BLE client device having d.addr
-func (d *GSP) Connect(ctx context.Context) (err error) {
+func (d *Device) Connect(ctx context.Context) (err error) {
 	// reset
 	d.resp = make(map[uint8]chan Packet)
 	d.subs = make(Subscriptions)
 
-	// BLE
-	dev, err := linux.NewDevice()
-	if err != nil {
-		return
-	}
-	ble.SetDefaultDevice(dev)
-
 	addr := ble.NewAddr(d.addr)
 
-	client, err := ble.Dial(ctx, addr)
-	if err != nil {
-		return
-	}
-
-	// tune MTU
-	_, err = client.ExchangeMTU(BleMTU)
-	if err != nil {
-		return
-	}
-
-	// discover and get desired characteristics
-	profile, err := client.DiscoverProfile(true)
-	if err != nil {
-		cerr := client.CancelConnection()
-		if cerr != nil {
-			log.Print(cerr)
-		}
-		return
-	}
-
-	svcUUID := ble.MustParse(gspServiceUUID)
-	wUUID := ble.MustParse(gspWriteUUID)
-	nUUID := ble.MustParse(gspNotifyUUID)
-
-	var writeChar *ble.Characteristic
-	var notifyChar *ble.Characteristic
-
-	for _, s := range profile.Services {
-		if !s.UUID.Equal(svcUUID) {
-			continue
-		}
-		for _, c := range s.Characteristics {
-			if c.UUID.Equal(wUUID) {
-				writeChar = c
-			}
-			if c.UUID.Equal(nUUID) {
-				notifyChar = c
-			}
-		}
-	}
-
-	if writeChar == nil || notifyChar == nil {
-		cerr := client.CancelConnection()
-		if cerr != nil {
-			log.Print(cerr)
-		}
-		return errors.New("GSP characteristics not found")
-	}
-
-	// setup notify
-	notifyC := make(chan []byte, BleMTU)
-
-	err = client.Subscribe(notifyChar, false, func(b []byte) {
-		d.log.Debug(fmt.Sprintf("%+v", b), "note", "receive bytes")
-		cp := make([]byte, len(b))
-		copy(cp, b)
-		notifyC <- cp
-	})
-	if err != nil {
-		cerr := client.CancelConnection()
-		if cerr != nil {
-			log.Print(cerr)
-		}
-		return
-	}
-
-	// setup transport
-	d.transport = &bleTransport{
-		log:     d.log,
-		client:  client,
-		write:   writeChar,
-		notify:  notifyChar,
-		notifyC: notifyC,
-	}
-
-	// receive loop: setup a go func to receive notified data, convert them to Packet.
-	// CodeCommandResponse are pushed to resp chans, while (CodeDataStream,CodeDataStream2) from subs is pushed to subs chans
 	go func() {
+		backoff := time.Second
+		for {
+			select {
+			case <-ctx.Done():
+				log.Print(ctx.Err())
+				return
+			default:
+			}
 
-		dBuf := []byte{}
-		for raw := range d.transport.Notify() {
-			// TODO: eventually move to clean shutdown, and turn to for { select {} }
+			// dial
+			dialTimeout := BleDialTimeoutSecond * time.Second
+			ctxDial, cancel := context.WithTimeout(ctx, dialTimeout)
+			defer cancel()
+			client, err := ble.Dial(ctxDial, addr)
+			if err != nil {
+				log.Printf("could not connect to %v in %v. Waiting %v to reconnect...", d.addr, dialTimeout, backoff)
+				time.Sleep(backoff)
+				if backoff < BackoffMaxSecond*time.Second {
+					backoff *= 2
+					if backoff > BackoffMaxSecond*time.Second {
+						backoff = BackoffMaxSecond * time.Second
+					}
+				}
+				continue
+			}
+			backoff = time.Second
 
+			// tune MTU
+			_, err = client.ExchangeMTU(BleMTU)
+			if err != nil {
+			}
+
+			// discover and get desired characteristics
+			profile, err := client.DiscoverProfile(true)
+			if err != nil {
+				log.Print(err)
+				continue
+			}
+
+			svcUUID := ble.MustParse(gspServiceUUID)
+			wUUID := ble.MustParse(gspWriteUUID)
+			nUUID := ble.MustParse(gspNotifyUUID)
+
+			var writeChar *ble.Characteristic
+			var notifyChar *ble.Characteristic
+
+			for _, s := range profile.Services {
+				if !s.UUID.Equal(svcUUID) {
+					continue
+				}
+				for _, c := range s.Characteristics {
+					if c.UUID.Equal(wUUID) {
+						writeChar = c
+					}
+					if c.UUID.Equal(nUUID) {
+						notifyChar = c
+					}
+				}
+			}
+
+			if writeChar == nil || notifyChar == nil {
+				log.Print(err)
+				continue
+			}
+
+			// setup notify
+			notifyC := make(chan []byte, BleMTU)
+
+			err = client.Subscribe(notifyChar, false, func(b []byte) {
+				d.log.Debug(fmt.Sprintf("%+v", b), "note", "receive bytes")
+				cp := make([]byte, len(b))
+				copy(cp, b)
+				notifyC <- cp
+			})
+			if err != nil {
+				log.Print(err)
+				continue
+			}
+
+			// setup transport
+			d.transport = &bleTransport{
+				log:     d.log,
+				client:  client,
+				write:   writeChar,
+				notify:  notifyChar,
+				notifyC: notifyC,
+			}
+
+			d.muSubs.Lock()
+			for ref, s := range d.subs {
+				// send subscribe (again in case of reconnect)
+				cmd := NewSubscribe(s.Path)
+				cmd.SetRef(ref)
+				_ = d.sendRaw(context.Background(), cmd)
+			}
+			d.muSubs.Unlock()
+
+			// receive loop: setup a go func to receive notified data, convert them to Packet.
+			// CodeCommandResponse are pushed to resp chans, while (CodeDataStream,CodeDataStream2) from subs is pushed to subs chans
+			d.handleConnection(client)
+		}
+	}()
+
+	return
+}
+
+func (d *Device) handleConnection(client ble.Client) {
+	d.isConnected = true
+	log.Print("Connected to ", d.addr)
+
+handleLoop:
+	for {
+		select {
+		case <-client.Disconnected():
+			d.isConnected = false
+			log.Print("client with addr: ", d.addr, " disconnected. Reconnecting...")
+			break handleLoop
+		case raw := <-d.transport.Notify():
 			d.log.Debug(fmt.Sprintf("%+v", raw), "note", "device receive notify bytes")
 
 			p, err := NewPacketFromBytes(raw)
@@ -220,33 +341,82 @@ func (d *GSP) Connect(ctx context.Context) (err error) {
 				d.muResp.Unlock()
 
 			case CodeDataStream:
-				// NOTE: assuming DataStream2 are send adjacent to DataStream and **NOT** interleaved on differente refs (when multiple subs are active)
-				// reseting
-				if len(dBuf) > 0 {
-					log.Panicf("subs buffer len not zero: want 0, got %d", len(dBuf))
-				}
-				dBuf = append(dBuf, p.Data...)
-				if d.sendSubDataIfComplete(dBuf, ref) {
-					dBuf = dBuf[:0]
+				// NOTE: assuming DataStream2 are sent adjacent to DataStream and **NOT** interleaved on different refs (when multiple subs are active)
+				s := d.subs[ref]
+				l := len(d.subs[ref].buf)
+
+				switch s.dataParts {
+				case PartsUnknow:
+					if l > 0 {
+						d.log.Info(fmt.Sprintf("subs ref %d learning: is PartOne", ref))
+						s.dataParts = PartsOne
+						s.C <- s.buf
+					}
+					s.buf = append([]byte{}, p.Data...)
+				case PartsOne:
+					// immediate send
+					s.C <- p.Data
+
+				case PartsTwo:
+					// save DATA
+					if l > 0 {
+						log.Panicf("buf len for subs ref %d error: want 0, got %d", ref, l)
+					}
+					s.buf = append([]byte{}, p.Data...)
 				}
 
 			case CodeDataStream2:
-				dBuf = append(dBuf, p.Data...)
-				if d.sendSubDataIfComplete(dBuf, ref) {
-					dBuf = dBuf[:0]
+				// NOTE: assuming DataStream2 are sent adjacent to DataStream and **NOT** interleaved on different refs (when multiple subs are active)
+				s := d.subs[ref]
+				l := len(d.subs[ref].buf)
+
+				switch s.dataParts {
+				case PartsUnknow:
+					if l > 0 {
+						d.log.Info(fmt.Sprintf("subs ref %d learning: is PartTwo", ref))
+						s.dataParts = PartsTwo
+						s.C <- append(s.buf, p.Data...)
+						s.buf = s.buf[:0]
+					}
+				case PartsOne:
+					log.Panicf("subs ref %d is PartOne and received DATA_PART2", ref)
+
+				case PartsTwo:
+					s.C <- append(s.buf, p.Data...)
+					s.buf = s.buf[:0]
 				}
 			}
-
 		}
-		log.Print("chan closed")
-
-	}()
-
+	}
 	return
 }
 
+// waitConencted recheck IsConnected, timeouts based on context and return nil if connected
+func (d *Device) waitConnected(parent context.Context) (err error) {
+	for {
+		select {
+
+		case <-parent.Done():
+			err = parent.Err()
+			log.Print("context done: ", err)
+			return
+		default:
+			if d.IsConnected() {
+				return
+			}
+			time.Sleep(RecheckConnectedMillisecond * time.Millisecond)
+		}
+	}
+}
+
 // Send sends cmd
-func (d *GSP) Send(parent context.Context, cmd Command) (any, error) {
+func (d *Device) Send(parent context.Context, cmd Command) (any, error) {
+
+	var err error
+
+	if err = d.waitConnected(parent); err != nil {
+		return nil, err
+	}
 
 	ctx, cancel := context.WithTimeout(parent, SendCtxTimeout*time.Second)
 	defer cancel()
@@ -255,7 +425,8 @@ func (d *GSP) Send(parent context.Context, cmd Command) (any, error) {
 	var ref uint8
 	if _, ok := cmd.(UnsubscribeCmd); ok {
 		// Unsubscribe command holds ref in the command
-		ref = cmd.GetRef()
+		// **and* it does not reply with CommandReponse (#2): so just send it and return
+		return nil, d.sendRaw(ctx, cmd)
 	} else {
 		ref = d.nextRef()
 		cmd.SetRef(ref)
@@ -268,7 +439,7 @@ func (d *GSP) Send(parent context.Context, cmd Command) (any, error) {
 	d.muResp.Unlock()
 
 	// send cmd
-	err := d.sendRaw(ctx, cmd)
+	err = d.sendRaw(ctx, cmd)
 	if err != nil {
 		return nil, err
 	}
@@ -298,7 +469,7 @@ func (d *GSP) Send(parent context.Context, cmd Command) (any, error) {
 		d.muSubs.Lock()
 		switch c := cmd.(type) {
 		case SubscribeCmd:
-			d.subs[c.GetRef()] = Subscription{Path: c.GetPath(), C: make(chan []byte, 1)}
+			d.subs[c.GetRef()] = NewSubscription(c.GetPath())
 		case UnsubscribeCmd:
 			close(d.subs[c.GetRef()].C)
 			delete(d.subs, c.GetRef())
@@ -313,12 +484,12 @@ func (d *GSP) Send(parent context.Context, cmd Command) (any, error) {
 }
 
 // GetSubs returns active Subcriptions
-func (d *GSP) GetSubs() Subscriptions {
+func (d *Device) GetSubs() Subscriptions {
 	return d.subs
 }
 
 // GetSubsRef return Subscription to path, or error
-func (d *GSP) GetSubsRef(path string) (ref uint8, err error) {
+func (d *Device) GetSubsRef(path string) (ref uint8, err error) {
 	for k, v := range d.subs {
 		if v.Path == path {
 			return k, nil
@@ -329,17 +500,17 @@ func (d *GSP) GetSubsRef(path string) (ref uint8, err error) {
 }
 
 // Addr returns addr (BLE MAC) of client to connect to
-func (d *GSP) Addr() string {
+func (d *Device) Addr() string {
 	return d.addr
 }
 
 // Close closes
-func (d *GSP) Close() error {
+func (d *Device) Close() error {
 	return d.transport.Close()
 }
 
 // nextRef finds next free ref
-func (d *GSP) nextRef() uint8 {
+func (d *Device) nextRef() uint8 {
 	d.muResp.Lock()
 	defer d.muResp.Unlock()
 
@@ -365,7 +536,7 @@ func (d *GSP) nextRef() uint8 {
 }
 
 // sendSubDataIfComplete sends data if packet is complete
-func (d *GSP) sendSubDataIfComplete(dBuf []byte, ref uint8) (sent bool) {
+func (d *Device) sendSubDataIfComplete(dBuf []byte, ref uint8) (sent bool) {
 	// FIXME: this is specific to IMU9, which sends n=4+(4*3)*k=4+12*n, with k proportional to Hz. Packet is complete when (n-4)%12==0
 	if (len(dBuf)-4)%12 == 0 {
 		select {
@@ -380,7 +551,7 @@ func (d *GSP) sendSubDataIfComplete(dBuf []byte, ref uint8) (sent bool) {
 }
 
 // sendRaw sends command and waits response
-func (d *GSP) sendRaw(ctx context.Context, cmd Command) (err error) {
+func (d *Device) sendRaw(ctx context.Context, cmd Command) (err error) {
 
 	select {
 	case <-ctx.Done():
