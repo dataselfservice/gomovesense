@@ -89,6 +89,10 @@ func NewSubscription(path string) *Subscription {
 // Subscriptions map of active subscriptions
 type Subscriptions map[uint8]*Subscription
 
+// dialMu serializes ble.Dial: the BLE controller accepts one pending LE
+// connection at a time, parallel dials fail with Command Disallowed.
+var dialMu sync.Mutex
+
 type GSP struct {
 	logLevel slog.Level
 	ctx      context.Context
@@ -205,10 +209,12 @@ func (d *Device) Connect(ctx context.Context) (err error) {
 			// dial
 			dialTimeout := BleDialTimeoutSecond * time.Second
 			ctxDial, cancel := context.WithTimeout(ctx, dialTimeout)
-			defer cancel()
+			dialMu.Lock()
 			client, err := ble.Dial(ctxDial, addr)
+			dialMu.Unlock()
+			cancel()
 			if err != nil {
-				log.Printf("could not connect to %v in %v. Waiting %v to reconnect...", d.addr, dialTimeout, backoff)
+				log.Printf("could not connect to %v (timeout %v): %v. Waiting %v to reconnect...", d.addr, dialTimeout, err, backoff)
 				time.Sleep(backoff)
 				if backoff < BackoffMaxSecond*time.Second {
 					backoff *= 2
@@ -506,6 +512,9 @@ func (d *Device) Addr() string {
 
 // Close closes
 func (d *Device) Close() error {
+	if d.transport == nil {
+		return nil
+	}
 	return d.transport.Close()
 }
 
