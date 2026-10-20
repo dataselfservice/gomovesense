@@ -169,7 +169,10 @@ type Device struct {
 	subs   Subscriptions
 	muSubs sync.Mutex
 
-	isConnected bool
+	muConn         sync.Mutex
+	isConnected    bool
+	connectedSince time.Time
+	connects       int
 }
 
 func NewDevice(addr string, logLevel slog.Level) *Device {
@@ -185,7 +188,36 @@ func NewDevice(addr string, logLevel slog.Level) *Device {
 
 // IsConnected return true when device is connected
 func (d *Device) IsConnected() bool {
+	d.muConn.Lock()
+	defer d.muConn.Unlock()
 	return d.isConnected
+}
+
+// ConnectedSince returns when the current connection was established (zero if disconnected)
+func (d *Device) ConnectedSince() time.Time {
+	d.muConn.Lock()
+	defer d.muConn.Unlock()
+	if !d.isConnected {
+		return time.Time{}
+	}
+	return d.connectedSince
+}
+
+// Connects returns the number of successful connections (reconnects = Connects()-1)
+func (d *Device) Connects() int {
+	d.muConn.Lock()
+	defer d.muConn.Unlock()
+	return d.connects
+}
+
+func (d *Device) setConnected(c bool) {
+	d.muConn.Lock()
+	defer d.muConn.Unlock()
+	d.isConnected = c
+	if c {
+		d.connectedSince = time.Now()
+		d.connects++
+	}
 }
 
 // Connect to BLE client device having d.addr
@@ -306,14 +338,14 @@ func (d *Device) Connect(ctx context.Context) (err error) {
 }
 
 func (d *Device) handleConnection(client ble.Client) {
-	d.isConnected = true
+	d.setConnected(true)
 	log.Print("Connected to ", d.addr)
 
 handleLoop:
 	for {
 		select {
 		case <-client.Disconnected():
-			d.isConnected = false
+			d.setConnected(false)
 			log.Print("client with addr: ", d.addr, " disconnected. Reconnecting...")
 			break handleLoop
 		case raw := <-d.transport.Notify():
