@@ -15,43 +15,47 @@ The following commands are implemented: `HELLO`, `GET`, `SUBSCRIBE`, `UNSUBSCRIB
 See: [command_test.go](./gsp/command_test.go), which can be run via:
 
 1. wake up the device (e.g. touch terminals with two fingers of one hand)
-2. `go test -c -o test ./gsp && sudo MOVESENSE_MAC=<MY_HR_MAC> ./test -test.v`
+2. `go test -c -o test ./gsp && sudo MAC=<MY_HR_MAC>[,<MAC2>...] HCI=hci0 ./test -test.v`
 
 ### Subscribe sample
 
 To receive data from a subscription:
 
-1. issue a successful `gsp.NewSubcribe(path)` command
-2. receive binary data from relevant ref channel: `<- GetSubs()[GetSubsRef(path)]`
+1. `gsp.New(ctx, level, "hci0")`, then `AddDevice(mac)` / `GetDevice(mac)`
+2. issue a successful `gsp.NewSubscribe(path)` command on the device
+3. receive binary data from relevant ref channel: `<- d.GetSubs()[d.GetSubsRef(path)]`
 
 See sample:
 ```go
-        hz:=416
+        hz := 416
         // connect
-        ms := gsp.New(mac, slog.LevelError)
-        if err := ms.Connect(ctx); err != nil {
-                log.Printf("Failed to connect to %s failed: %v", mac, err)
+        ms := gsp.New(ctx, slog.LevelError, "hci0")
+        if err := ms.AddDevice(mac); err != nil {
+                log.Printf("Failed to connect to %s: %v", mac, err)
                 return
+        }
+        d, err := ms.GetDevice(mac)
+        if err != nil {
+                log.Panicf("cannot get device %s: %v", mac, err)
         }
         log.Printf("Connected to %v", mac)
         // subscribe
         path := fmt.Sprintf("/Meas/IMU9/%d", hz)
         cmd := gsp.NewSubscribe(path)
-        _, err = ms.Send(ctx, cmd)
+        _, err = d.Send(ctx, cmd)
         if err != nil {
                 log.Panicf("subscribe to %s failed: %v", path, err)
         }
         // receive data
-        ref, err := ms.GetSubsRef(path)
+        ref, err := d.GetSubsRef(path)
         if err != nil {
                 log.Panicf("cannot get ref for %s: %v", path, err)
         }
-        subs := ms.GetSubs()
+        subs := d.GetSubs()
         for {
                 data := <-subs[ref].C
                 // USE data
                 // ...
-                }
         }
 ```
 

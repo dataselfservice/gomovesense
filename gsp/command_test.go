@@ -36,7 +36,11 @@ func TestMain(m *testing.M) {
 	ctx, cancel = context.WithTimeout(context.Background(), 60*time.Second)
 
 	// movesense
-	gsp = New(ctx, slog.LevelError)
+	hci := os.Getenv("HCI")
+	if hci == "" {
+		hci = "hci0"
+	}
+	gsp = New(ctx, slog.LevelError, hci)
 	if gsp == nil {
 		log.Panic("cannot create GSP")
 	}
