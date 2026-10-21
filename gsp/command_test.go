@@ -22,7 +22,8 @@ var (
 func TestMain(m *testing.M) {
 	macsEnv := os.Getenv("MAC")
 	if macsEnv == "" {
-		os.Exit(0)
+		// no sensor: unit tests only, TestDevice has no MAC to run
+		os.Exit(m.Run())
 	}
 	macs = strings.Split(macsEnv, ",")
 	for i := range macs {
@@ -84,6 +85,23 @@ func TestDevice(t *testing.T) {
 			for _, pathGet := range pathsGet {
 				runGet(t, dev, pathGet)
 			}
+
+			// PUT_UTCTIME, then read back the time mapping and battery
+			if err := dev.PutUTCTime(ctx, time.Now()); err != nil {
+				t.Fatalf("PUT_UTCTIME failed: %v", err)
+			}
+			dt, err := dev.DetailedTime(ctx)
+			if err != nil {
+				t.Fatalf("GET %s failed: %v", PathTimeDetailed, err)
+			}
+			if d := time.Since(dt.UTC); d < 0 || d > 2*time.Second {
+				t.Errorf("%s: sensor UTC %v off by %v", dev.Addr(), dt.UTC, d)
+			}
+			lvl, err := dev.EnergyLevel(ctx)
+			if err != nil {
+				t.Fatalf("GET %s failed: %v", PathEnergyLevel, err)
+			}
+			t.Logf("%s: time %+v, battery %d%%", dev.Addr(), dt, lvl)
 
 			// SUBSCRIBE
 			pathsSubs := []string{

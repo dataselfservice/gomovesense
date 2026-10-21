@@ -6,7 +6,7 @@ Tested on `linux/amd64` and `linux/arm` hosts, connecting to [HR+][] devices wit
 
 It relies on [go-ble](<github.com/go-ble/ble>), which requires root privileges.
 
-The following commands are implemented: `HELLO`, `GET`, `SUBSCRIBE`, `UNSUBSCRIBE` based on [GSP][]. API are documented in [Movesense API][MAPI] and more details can be found in [Swagger definitions][MAPI-src]. Interleaved subscribed command are supported.
+The following commands are implemented: `HELLO`, `GET`, `SUBSCRIBE`, `UNSUBSCRIBE`, `PUT_UTCTIME` based on [GSP][], plus `Device` helpers `PutUTCTime`, `DetailedTime` (`/Time/Detailed`: relative ms to UTC mapping) and `EnergyLevel` (`/System/Energy/Level`: battery %). API are documented in [Movesense API][MAPI] and more details can be found in [Swagger definitions][MAPI-src]. Interleaved subscribed command are supported.
 
 ---
 
