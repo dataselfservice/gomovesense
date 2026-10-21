@@ -1,10 +1,16 @@
 package gsp
 
+import (
+	"encoding/binary"
+	"time"
+)
+
 const (
 	CmdHello       = 0
 	CmdSubscribe   = 1
 	CmdUnsubscribe = 2
 	CmdGet         = 4
+	CmdPutUTCTime  = 8
 )
 
 // HelloCmd see: https://www.movesense.com/docs/esw/gatt_sensordata_protocol/#hello
@@ -85,5 +91,18 @@ func NewUnsubscribe(ref uint8) (uc UnsubscribeCmd) {
 	return
 }
 func (c UnsubscribeCmd) Decode(cr CommandResponse) (any, error) {
+	return cr.Data, nil
+}
+
+// PutUTCTimeCmd see: https://www.movesense.com/docs/esw/gatt_sensordata_protocol/#put_utctime
+type PutUTCTimeCmd struct {
+	*Packet
+}
+
+// NewPutUTCTime sets the sensor UTC clock to t (microseconds since epoch)
+func NewPutUTCTime(t time.Time) PutUTCTimeCmd {
+	return PutUTCTimeCmd{NewCommand(CmdPutUTCTime, binary.LittleEndian.AppendUint64(nil, uint64(t.UnixMicro())))}
+}
+func (c PutUTCTimeCmd) Decode(cr CommandResponse) (any, error) {
 	return cr.Data, nil
 }
