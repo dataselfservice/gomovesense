@@ -240,8 +240,9 @@ func (d *Device) Connect(ctx context.Context) (err error) {
 
 			// dial
 			dialTimeout := BleDialTimeoutSecond * time.Second
-			ctxDial, cancel := context.WithTimeout(ctx, dialTimeout)
+			// timeout starts after the lock: waiting for another dial must not consume it
 			dialMu.Lock()
+			ctxDial, cancel := context.WithTimeout(ctx, dialTimeout)
 			client, err := ble.Dial(ctxDial, addr)
 			dialMu.Unlock()
 			cancel()
